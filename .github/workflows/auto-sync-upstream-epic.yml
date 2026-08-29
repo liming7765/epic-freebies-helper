@@ -1,0 +1,264 @@
+name: Auto Sync Upstream + Keepalive
+
+on:
+  schedule:
+    # Wednesday 11:30 UTC = Wednesday 19:30 China Standard Time.
+    # Sync one day before the Thursday Epic claim workflow.
+    - cron: "30 11 * * 3"
+  workflow_dispatch:
+    inputs:
+      force_keepalive_test:
+        description: "TEST ONLY: create a keepalive commit even if not 42 days old"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: epic-auto-sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: Ronchy2000/epic-freebies-helper
+  UPSTREAM_BRANCH: master
+  KEEPALIVE_AFTER_DAYS: "42"
+  KEEPALIVE_MARKER: "[epic-keepalive]"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+      - name: Inspect upstream status
+        id: status
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ORIGINAL_HEAD="$(git rev-parse HEAD)"
+          BEHIND="$(git rev-list --count HEAD.."upstream/${UPSTREAM_BRANCH}")"
+          AHEAD="$(git rev-list --count "upstream/${UPSTREAM_BRANCH}"..HEAD)"
+          UPSTREAM_SHA="$(git rev-parse --short=12 "upstream/${UPSTREAM_BRANCH}")"
+          UPSTREAM_SUBJECT="$(git log -1 --format=%s "upstream/${UPSTREAM_BRANCH}")"
+
+          {
+            echo "original_head=${ORIGINAL_HEAD}"
+            echo "behind=${BEHIND}"
+            echo "ahead=${AHEAD}"
+            echo "upstream_sha=${UPSTREAM_SHA}"
+            echo "upstream_subject<<EOF"
+            echo "${UPSTREAM_SUBJECT}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Fork is ${BEHIND} commit(s) behind upstream and ${AHEAD} commit(s) ahead."
+
+      - name: Merge upstream automatically
+        id: merge
+        if: steps.status.outputs.behind != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+            echo "Upstream merged successfully."
+          else
+            echo "::warning::Automatic merge conflicted. Aborting without changing the remote branch."
+            git merge --abort || true
+            git reset --hard "${{ steps.status.outputs.original_head }}"
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Prepare sync summary
+        id: summary
+        if: steps.merge.outputs.result == 'merged'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DIFF_STAT="$(git diff --stat "${{ steps.status.outputs.original_head }}"..HEAD | tail -n 20)"
+          {
+            echo "diff_stat<<EOF"
+            echo "${DIFF_STAT}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Push merged upstream
+        id: push_sync
+        if: steps.merge.outputs.result == 'merged'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Calculate repository inactivity
+        id: inactivity
+        if: steps.status.outputs.behind == '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          LAST_COMMIT_TS="$(git log -1 --format=%ct)"
+          NOW_TS="$(date +%s)"
+          AGE_DAYS="$(( (NOW_TS - LAST_COMMIT_TS) / 86400 ))"
+
+          echo "age_days=${AGE_DAYS}" >> "$GITHUB_OUTPUT"
+          echo "Default branch HEAD is ${AGE_DAYS} day(s) old."
+
+      - name: Create keepalive commit when needed
+        id: keepalive
+        if: >-
+          steps.status.outputs.behind == '0' &&
+          (
+            steps.inactivity.outputs.age_days >= env.KEEPALIVE_AFTER_DAYS ||
+            (github.event_name == 'workflow_dispatch' && inputs.force_keepalive_test == true)
+          )
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git commit --allow-empty \
+            -m "chore: keep scheduled workflows active ${KEEPALIVE_MARKER}" \
+            -m "No repository files changed. Generated automatically because upstream had no new commits."
+
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Telegram - upstream synced
+        if: steps.push_sync.outputs.pushed == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BEHIND: ${{ steps.status.outputs.behind }}
+          UPSTREAM_SHA: ${{ steps.status.outputs.upstream_sha }}
+          UPSTREAM_SUBJECT: ${{ steps.status.outputs.upstream_subject }}
+          DIFF_STAT: ${{ steps.summary.outputs.diff_stat }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] || exit 0
+
+          TEXT="$(cat <<EOF
+          🔄 Epic 上游已自动同步
+
+          仓库：${REPOSITORY}
+          合并上游提交：${BEHIND} 个
+          上游版本：${UPSTREAM_SHA}
+          ${UPSTREAM_SUBJECT}
+
+          ${DIFF_STAT}
+
+          https://github.com/${REPOSITORY}
+          EOF
+          )"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            >/dev/null
+
+      - name: Notify Telegram - merge conflict
+        if: steps.merge.outputs.result == 'conflict'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BEHIND: ${{ steps.status.outputs.behind }}
+          UPSTREAM_SHA: ${{ steps.status.outputs.upstream_sha }}
+          UPSTREAM_SUBJECT: ${{ steps.status.outputs.upstream_subject }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] || exit 0
+
+          TEXT="$(cat <<EOF
+          ⚠️ Epic 上游自动同步发生冲突
+
+          仓库：${REPOSITORY}
+          落后上游：${BEHIND} 个 commit
+          上游版本：${UPSTREAM_SHA}
+          ${UPSTREAM_SUBJECT}
+
+          本次已经自动回滚，没有 push。
+          请手动检查 Sync fork / Compare changes。
+
+          https://github.com/${REPOSITORY}
+          EOF
+          )"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            >/dev/null
+
+      - name: Notify Telegram - keepalive created
+        if: steps.keepalive.outputs.created == 'true'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          AGE_DAYS: ${{ steps.inactivity.outputs.age_days }}
+          KEEPALIVE_SHA: ${{ steps.keepalive.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]] || exit 0
+
+          TEXT="$(cat <<EOF
+          🫀 Epic Actions 保活
+
+          ${REPOSITORY} 上游暂无更新，
+          默认分支已 ${AGE_DAYS} 天没有新 commit。
+
+          已创建空 keepalive commit：${KEEPALIVE_SHA}
+          没有修改任何仓库文件。
+          EOF
+          )"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${TEXT}" \
+            >/dev/null
+
+      - name: Fail job when merge conflicted
+        if: steps.merge.outputs.result == 'conflict'
+        shell: bash
+        run: |
+          echo "::error::Upstream merge conflict. Nothing was pushed."
+          exit 1
